@@ -1,12 +1,12 @@
-// api/gpt.ts
+// api/gpt.ts  (의존성/설치 없이 동작)
 export default async function handler(req: any, res: any) {
-  // CORS (원치 않으면 삭제 가능)
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  // 헬스체크용 GET (브라우저로 확인할 때 편함)
+  // 헬스체크 (GET)
   if (req.method === "GET") {
     return res.status(200).json({ ok: true, route: "/api/gpt" });
   }
@@ -51,5 +51,3 @@ export default async function handler(req: any, res: any) {
     return res.status(500).json({ error: e.message || "OpenAI request failed" });
   }
 }
-
-
