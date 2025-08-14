@@ -1,32 +1,30 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node'
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
-  }
-
-  const { prompt } = req.body
-
-  if (!prompt) {
-    return res.status(400).json({ error: 'No prompt provided' })
-  }
-
+// api/gpt.ts
+export default async function handler(req: any, res: any) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const { prompt, model = "gpt-4o-mini", mode = "preset" } = req.body || {};
+  const system =
+    mode === "preset"
+      ? "You are a Firefly prompt generator. Return a single English prompt optimized for Adobe Firefly image generation with this structure: [subject] in [place], [time/weather], [style], [color], [composition], [detail]. Use cinematic lighting and clear scene descriptions. No extra commentary."
+      : "You are a helpful assistant.";
   try {
-    const apiRes = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        input: prompt,
+        model,
+        input: [
+          { role: "system", content: system },
+          { role: "user", content: prompt || "" },
+        ],
       }),
-    })
-
-    const data = await apiRes.json()
-    return res.status(200).json(data)
-  } catch (err) {
-    return res.status(500).json({ error: 'Request failed', details: err })
+    });
+    const j = await r.json();
+    const text = (j as any)?.output_text || (j as any)?.choices?.[0]?.message?.content || "";
+    res.status(200).json({ text });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
   }
 }
