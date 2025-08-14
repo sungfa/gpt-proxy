@@ -1,7 +1,10 @@
-// api/gpt.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' })
+  }
+
   const { prompt } = req.body
 
   if (!prompt) {
@@ -13,17 +16,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
         model: 'gpt-4o-mini',
-        input: prompt
-      })
+        input: prompt,
+      }),
     })
 
     const data = await apiRes.json()
-    res.status(200).json(data)
+    return res.status(200).json(data)
   } catch (err) {
-    res.status(500).json({ error: 'Request failed', details: err })
+    return res.status(500).json({ error: 'Request failed', details: err })
   }
 }
