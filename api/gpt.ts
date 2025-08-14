@@ -2,34 +2,28 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
+  const { prompt } = req.body
+
+  if (!prompt) {
+    return res.status(400).json({ error: 'No prompt provided' })
   }
 
   try {
-    const { prompt, model = 'gpt-4o-mini' } = req.body
-    const apiKey = process.env.OPENAI_API_KEY
-
-    if (!apiKey) {
-      return res.status(500).json({ error: 'OPENAI_API_KEY is missing' })
-    }
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const apiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7
+        model: 'gpt-4o-mini',
+        input: prompt
       })
     })
 
-    const data = await response.json()
+    const data = await apiRes.json()
     res.status(200).json(data)
-  } catch (error: any) {
-    res.status(500).json({ error: error.message })
+  } catch (err) {
+    res.status(500).json({ error: 'Request failed', details: err })
   }
 }
