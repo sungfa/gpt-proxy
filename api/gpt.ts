@@ -79,14 +79,14 @@ export default async function handler(req: any, res: any) {
       j?.choices?.[0]?.message?.content ??
       j?.output_text ?? "";
 
-    return res.status(r.status).json({
-      ok: r.ok,
-      status: r.status,
-      provider: "openrouter",
-      model,
-      text,
-      error: j?.error?.message,
-    });
+return res.status(r.status).json({
+  ok: r.ok,
+  status: r.status,
+  provider: "openrouter",
+  model, // ✅ 여기에 현재 사용된 모델 이름 포함
+  text,
+  error: j?.error?.message,
+});
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || "OpenRouter request failed" });
   }
