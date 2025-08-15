@@ -1,4 +1,9 @@
-// /api/gpt.ts — OpenRouter Vision + Firefly Prompt Agent
+// /api/vision-firefly.ts
+// (Vercel Serverless Function)
+// Requirements:
+// - Env: OPENROUTER_API_KEY
+// - Optional Env: OPENROUTER_MODEL (default: "openai/gpt-4o-mini")
+// - Optional Env: APP_URL, APP_NAME (OpenRouter meta headers)
 
 function setCors(res: any) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -7,9 +12,29 @@ function setCors(res: any) {
 }
 
 async function parseBody(req: any) {
-  if (typeof req.json === "function") return await req.json();
+  if (typeof req.json === "function") return await req.json(); // Edge runtime
   if (typeof req.body === "string") return JSON.parse(req.body);
   return req.body || {};
+}
+
+function buildFinalPrompt(a: any) {
+  // 안전하게 빈 값 제거 후 연결
+  const parts = [
+    a?.subject && `${a.subject}`,
+    a?.place && `in ${a.place}`,
+    a?.time_weather && `${a.time_weather}`,
+    a?.style && `${a.style}`,
+    a?.color && `${a.color}`,
+    a?.composition && `${a.composition}`,
+    a?.camera && `${a.camera}`,
+    a?.lighting && `${a.lighting}`,
+    a?.details && `${a.details}`,
+  ].filter(Boolean);
+
+  // Firefly가 잘 먹는 마무리 품질 태그 (과하면 역효과라 기본만)
+  const quality = "ultra detailed, cinematic lighting, 8k resolution";
+
+  return [parts.join(", "), quality].filter(Boolean).join(", ");
 }
 
 export default async function handler(req: any, res: any) {
@@ -19,8 +44,14 @@ export default async function handler(req: any, res: any) {
     return res.status(200).json({
       ok: true,
       provider: "openrouter",
-      route: "/api/gpt",
-      note: "POST { mode, model, prompt, image_url|image_base64 }",
+      route: "/api/vision-firefly",
+      expects: {
+        image_url: "string (optional)",
+        image_base64: "string (optional, raw base64 WITHOUT prefix)",
+        memo: "string (optional, ko/en free-form hints)",
+        temperature: "number (optional)",
+        model: "string (optional)",
+      },
     });
   }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
@@ -28,104 +59,144 @@ export default async function handler(req: any, res: any) {
   const API_KEY = process.env.OPENROUTER_API_KEY;
   if (!API_KEY) return res.status(500).json({ error: "Missing OPENROUTER_API_KEY" });
 
-  let body: any = {};
-  try { body = await parseBody(req); } catch { return res.status(400).json({ error: "Invalid JSON body" }); }
+  let body: any;
+  try {
+    body = await parseBody(req);
+  } catch {
+    return res.status(400).json({ error: "Invalid JSON body" });
+  }
 
   const {
-    // 모드: raw(그대로), firefly(텍스트→Firefly), vision_firefly(이미지 분석→Firefly)
-    mode = "vision_firefly",
-    // Vision 가능한 모델 권장: openai/gpt-4o (또는 openai/gpt-4o-mini)
-    model = process.env.OPENROUTER_MODEL || "openai/gpt-4o",
-    prompt,                   // 선택: 이미지 + 추가 요구사항
-    image_url,                // data:uri or https url
-    image_base64,             // 순수 base64 (prefix 없이) 도 허용
-    temperature = 0.4,
-    top_p = 1,
-    seed,                     // 재현성 원하면 숫자
-    max_output_tokens = 400,  // 길이 확보
+    image_url,
+    image_base64,
+    memo = "",
+    temperature = 0.6,
+    model = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
   } = body || {};
 
-  if (mode === "vision_firefly" && !image_url && !image_base64) {
-    return res.status(400).json({ error: "image_url or image_base64 is required for vision_firefly" });
+  if (!image_url && !image_base64) {
+    return res.status(400).json({
+      error: "Provide either 'image_url' or 'image_base64' (raw base64 without data URL prefix).",
+    });
   }
 
-  // 메시지 구성
-  const messages: any[] = [];
+  // OpenRouter 권장 메타(선택)
+  const referer = process.env.APP_URL || "https://example.com";
+  const title = process.env.APP_NAME || "Firefly Prompt Agent";
 
-  // 시스템 프롬프트 (Firefly 최적화)
-  const SYS_FIREFLY =
-    "You analyze images and craft a single, high-quality English prompt optimized for Adobe Firefly image generation." +
-    " The prompt MUST be one concise line, no JSON, no extra commentary." +
-    " Focus on: [main subject], [place/background], [time/weather], [style], [color palette], [lighting], [composition], [detail level/resolution]." +
-    " Prefer cinematic, reproducible descriptions. No camera brands. No subjective opinions.";
+  // 이미지 컨텐츠 구성 (OpenAI/OR 호환)
+  const imageBlock = image_url
+    ? { type: "image_url", image_url: { url: image_url } }
+    : { type: "image_url", image_url: { url: `data:image/*;base64,${image_base64}` } };
 
-  // 이미지 컨텐츠 구성
-  function imageContent() {
-    if (image_url) {
-      return { type: "image_url", image_url: { url: image_url } };
-    }
-    if (image_base64) {
-      return { type: "image_url", image_url: { url: `data:image/png;base64,${image_base64}` } };
-    }
-    return null;
-  }
+  // 시스템 프롬프트: JSON만 반환하도록 강하게 가이드
+  const system = `
+You are an expert visual analyst and a prompt engineer for Adobe Firefly image generation.
+Analyze the given image and produce a concise JSON (no extra text) describing the scene.
+- Accept user's memo (which may be in Korean) and reflect it appropriately.
+- Translate concepts to natural English where needed.
+Return ONLY valid JSON with these fields:
 
-  if (mode === "vision_firefly") {
-    messages.push({ role: "system", content: SYS_FIREFLY });
-    const content: any[] = [];
-    const img = imageContent();
-    if (img) content.push(img);
-    if (prompt) content.push({ type: "text", text: String(prompt) });
-    else content.push({ type: "text", text: "Analyze the image and craft the Firefly-ready prompt." });
-    messages.push({ role: "user", content });
-  } else if (mode === "firefly") {
-    messages.push({ role: "system", content: SYS_FIREFLY });
-    const content: any[] = [];
-    if (prompt) content.push({ type: "text", text: String(prompt) });
-    messages.push({ role: "user", content });
-  } else {
-    // raw: 시스템 프롬프트 없이 그대로 전달
-    const content: any[] = [];
-    if (prompt) content.push({ type: "text", text: String(prompt) });
-    const img = imageContent();
-    if (img) content.push(img);
-    if (!content.length) return res.status(400).json({ error: "No content provided" });
-    messages.push({ role: "user", content });
-  }
+{
+  "subject": "short subject phrase",
+  "place": "location/background in a short phrase",
+  "time_weather": "time/weather (e.g., 'at midnight on a rainy night')",
+  "style": "art/style keywords (e.g., 'cinematic, cyberpunk, digital illustration')",
+  "color": "dominant colors or palette keywords",
+  "composition": "framing/composition (e.g., 'close-up portrait, rule-of-thirds')",
+  "camera": "camera details if applicable (e.g., '50mm lens, shallow depth of field')",
+  "lighting": "lighting mood (e.g., 'moody, neon-lit city lights')",
+  "details": "extra scene details",
+  "negatives": "things to avoid (optional)"
+}
+Return strictly JSON with no markdown fences.
+`.trim();
 
-  const referer = process.env.APP_URL  || "https://example.com";
-  const title   = process.env.APP_NAME || "Firefly Prompt Agent";
+  // 사용자 입력(텍스트 + 이미지)
+  const content = [
+    {
+      type: "text",
+      text:
+        `Analyze this image and produce JSON for Firefly.\n` +
+        (memo ? `User memo/hints: ${memo}\n` : "") +
+        `Respond in English JSON only.`,
+    },
+    imageBlock,
+  ];
 
   try {
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${API_KEY}`,
-        "HTTP-Referer":  referer,
-        "X-Title":       title,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${API_KEY}`,
+        "HTTP-Referer": referer,
+        "X-Title": title,
       },
       body: JSON.stringify({
         model,
-        messages,
         temperature,
-        top_p,
-        ...(seed ? { seed } : {}),
-        ...(max_output_tokens ? { max_output_tokens } : {}),
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content },
+        ],
       }),
     });
 
     const j = await r.json().catch(() => ({} as any));
-    const text = j?.choices?.[0]?.message?.content ?? j?.output_text ?? "";
 
-    return res.status(r.status).json({
+    // 모델/프로바이더 추출
+    const modelUsed =
+      j?.model || j?.choices?.[0]?.model || model || "unknown";
+    const provider = "openrouter";
+
+    // JSON 파싱 시도
+    let analysis: any = null;
+    let textCandidate =
+      j?.choices?.[0]?.message?.content ?? j?.output_text ?? "";
+
+    if (textCandidate) {
+      try {
+        analysis = JSON.parse(textCandidate);
+      } catch {
+        // 모델이 JSON 외 텍스트를 섞어버렸을 때 대비: 중괄호만 추출 시도
+        const m = textCandidate.match(/\{[\s\S]*\}/);
+        if (m) {
+          try {
+            analysis = JSON.parse(m[0]);
+          } catch {
+            // 실패하면 null 유지
+          }
+        }
+      }
+    }
+
+    // 분석 실패 시 간단한 백업 분석 (아주 러프)
+    if (!analysis || typeof analysis !== "object") {
+      analysis = {
+        subject: "a person",
+        place: "",
+        time_weather: "",
+        style: "cinematic",
+        color: "",
+        composition: "",
+        camera: "",
+        lighting: "",
+        details: "",
+        negatives: "",
+      };
+    }
+
+    const finalPrompt = buildFinalPrompt(analysis);
+
+    return res.status(r.status || 200).json({
       ok: r.ok,
-      status: r.status,
-      provider: "openrouter",
-      model: j?.model || model,
-      text,
-      error: j?.error?.message,
-      // raw: j, // (디버깅용 필요 시 주석 해제)
+      status: r.status || 200,
+      provider,
+      model: modelUsed,
+      final_prompt: finalPrompt,
+      analysis,
+      raw: j,
     });
   } catch (e: any) {
     return res.status(500).json({ error: e?.message || "OpenRouter request failed" });
