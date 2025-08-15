@@ -1,6 +1,5 @@
-// /api/gpt.ts — Vercel Serverless Function (CORS + body parse + 429 재시도)
+// /api/gpt.ts — OpenRouter 전용 프록시 (CORS/바디파싱/에러표시 포함)
 
-// ---------- 공통 유틸 ----------
 function setCors(res: any) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -8,58 +7,27 @@ function setCors(res: any) {
 }
 
 async function parseBody(req: any) {
-  // Edge(whatwg) | Node | Raw string 모두 대응
-  if (typeof req.json === "function") return await req.json();
+  if (typeof req.json === "function") return await req.json(); // Edge
   if (typeof req.body === "string") return JSON.parse(req.body);
   return req.body || {};
 }
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// OpenAI Chat Completions 호출 + 429 재시도(최대 3회)
-async function callOpenAI(payload: any, apiKey: string) {
-  let lastJson: any = null;
-
-  for (let i = 0; i < 3; i++) {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const j = await r.json().catch(() => ({}));
-    lastJson = j;
-
-    // 레이트리밋이면 백오프 후 재시도
-    if (r.status === 429) {
-      const retryAfter = Number(r.headers.get("retry-after") || "0");
-      await sleep(retryAfter ? retryAfter * 1000 : 500 * Math.pow(2, i));
-      continue;
-    }
-
-    return { r, j };
-  }
-
-  // 3회 모두 429면 여기로
-  return {
-    r: { ok: false, status: 429 } as any,
-    j: lastJson || { error: { message: "Rate limited" } },
-  };
-}
-
-// ---------- 메인 핸들러 ----------
 export default async function handler(req: any, res: any) {
   setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method === "GET") return res.status(200).json({ ok: true, route: "/api/gpt" });
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      provider: "openrouter",
+      route: "/api/gpt",
+    });
+  }
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // 바디 파싱
+  // 환경변수 체크
+  const API_KEY = process.env.OPENROUTER_API_KEY;
+  if (!API_KEY) return res.status(500).json({ error: "Missing OPENROUTER_API_KEY" });
+
   let body: any;
   try {
     body = await parseBody(req);
@@ -69,44 +37,57 @@ export default async function handler(req: any, res: any) {
 
   const {
     prompt,
-    model = "gpt-4o-mini",      // 필요시 gpt-4o 등으로 교체 가능
-    mode  = "preset",            // "preset"은 Firefly용 톤, "raw"는 일반 대화
-    temperature = 0.7,           // 선택
+    // OpenRouter에서 지원하는 모델명 사용. 기본값은 env → 없으면 무료/저가 후보
+    model = process.env.OPENROUTER_MODEL || "meta-llama/llama-3.1-8b-instruct:free",
+    mode = "preset",
+    temperature = 0.7,
   } = body || {};
 
-  if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
-  if (!prompt)                      return res.status(400).json({ error: "No prompt provided" });
+  if (!prompt) return res.status(400).json({ error: "No prompt provided" });
 
+  // Firefly 프리셋 / 일반 대화
   const system =
     mode === "preset"
       ? "You are a Firefly prompt generator. Return a single English prompt optimized for Adobe Firefly image generation with this structure: [subject] in [place], [time/weather], [style], [color], [composition], [detail]. Use cinematic lighting and clear scene descriptions. No extra commentary."
       : "You are a helpful assistant.";
 
-  const payload = {
-    model,
-    messages: [
-      { role: "system", content: system },
-      { role: "user",   content: String(prompt) },
-    ],
-    temperature,
-  };
+  // OpenRouter 권장 메타(선택)
+  const referer = process.env.APP_URL || "https://example.com";
+  const title = process.env.APP_NAME || "Framer GPT Console";
 
   try {
-    const { r, j } = await callOpenAI(payload, process.env.OPENAI_API_KEY!);
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${API_KEY}`,
+        "HTTP-Referer": referer,
+        "X-Title": title,
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: String(prompt) },
+        ],
+      }),
+    });
 
+    const j = await r.json().catch(() => ({} as any));
     const text =
       j?.choices?.[0]?.message?.content ??
-      j?.output_text ?? // 혹시 다른 응답 포맷 대비
-      "";
+      j?.output_text ?? "";
 
-    // 디버깅 편의 위해 status / error 함께 반환
-    return res.status((r as any).status || 200).json({
-      ok: (r as any).ok ?? true,
-      status: (r as any).status ?? 200,
+    return res.status(r.status).json({
+      ok: r.ok,
+      status: r.status,
+      provider: "openrouter",
+      model,
       text,
       error: j?.error?.message,
     });
   } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "OpenAI request failed" });
+    return res.status(500).json({ error: e?.message || "OpenRouter request failed" });
   }
 }
