@@ -1,204 +1,208 @@
-// /api/vision-firefly.ts
-// (Vercel Serverless Function)
-// Requirements:
-// - Env: OPENROUTER_API_KEY
-// - Optional Env: OPENROUTER_MODEL (default: "openai/gpt-4o-mini")
-// - Optional Env: APP_URL, APP_NAME (OpenRouter meta headers)
+// /api/gpt.ts
+// ✅ GPT Proxy API (Vercel 서버리스 함수)
+// - preset: 일반 Chat
+// - vision_firefly: 이미지/프롬프트 분석
+// - translate_ko: 영문 → 한글 번역
+// - raw: 그대로 프롬프트 전달
+// ------------------------------------------
 
-function setCors(res: any) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
+export const config = {
+  runtime: "edge",
+};
 
-async function parseBody(req: any) {
-  if (typeof req.json === "function") return await req.json(); // Edge runtime
-  if (typeof req.body === "string") return JSON.parse(req.body);
-  return req.body || {};
-}
-
-function buildFinalPrompt(a: any) {
-  // 안전하게 빈 값 제거 후 연결
-  const parts = [
-    a?.subject && `${a.subject}`,
-    a?.place && `in ${a.place}`,
-    a?.time_weather && `${a.time_weather}`,
-    a?.style && `${a.style}`,
-    a?.color && `${a.color}`,
-    a?.composition && `${a.composition}`,
-    a?.camera && `${a.camera}`,
-    a?.lighting && `${a.lighting}`,
-    a?.details && `${a.details}`,
-  ].filter(Boolean);
-
-  // Firefly가 잘 먹는 마무리 품질 태그 (과하면 역효과라 기본만)
-  const quality = "ultra detailed, cinematic lighting, 8k resolution";
-
-  return [parts.join(", "), quality].filter(Boolean).join(", ");
-}
-
-export default async function handler(req: any, res: any) {
-  setCors(res);
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      provider: "openrouter",
-      route: "/api/vision-firefly",
-      expects: {
-        image_url: "string (optional)",
-        image_base64: "string (optional, raw base64 WITHOUT prefix)",
-        memo: "string (optional, ko/en free-form hints)",
-        temperature: "number (optional)",
-        model: "string (optional)",
-      },
+export default async function handler(req: Request): Promise<Response> {
+  // ✅ CORS 프리플라이트 처리
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 200,
+      headers: corsHeaders,
     });
   }
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  const API_KEY = process.env.OPENROUTER_API_KEY;
-  if (!API_KEY) return res.status(500).json({ error: "Missing OPENROUTER_API_KEY" });
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: corsHeaders,
+    });
+  }
 
-  let body: any;
-  try {
-    body = await parseBody(req);
-  } catch {
-    return res.status(400).json({ error: "Invalid JSON body" });
+  const body = await req.json().catch(() => null);
+  if (!body) {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: corsHeaders,
+    });
   }
 
   const {
-    image_url,
-    image_base64,
-    memo = "",
-    temperature = 0.6,
     model = process.env.OPENROUTER_MODEL || "openai/gpt-4o-mini",
-  } = body || {};
+    mode = "preset",
+    prompt,
+    text,
+    messages,
+    imageUrl,
+    temperature = 0.7,
+  } = body;
 
-  if (!image_url && !image_base64) {
-    return res.status(400).json({
-      error: "Provide either 'image_url' or 'image_base64' (raw base64 without data URL prefix).",
+  if (!process.env.OPENROUTER_API_KEY) {
+    return new Response(JSON.stringify({ error: "Missing API key" }), {
+      status: 500,
+      headers: corsHeaders,
     });
   }
 
-  // OpenRouter 권장 메타(선택)
-  const referer = process.env.APP_URL || "https://example.com";
-  const title = process.env.APP_NAME || "Firefly Prompt Agent";
+  // ✅ 공통 요청 옵션
+  const baseHeaders = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+    "HTTP-Referer": process.env.APP_URL || "https://example.com",
+    "X-Title": process.env.APP_NAME || "Framer GPT Console",
+  };
 
-  // 이미지 컨텐츠 구성 (OpenAI/OR 호환)
-  const imageBlock = image_url
-    ? { type: "image_url", image_url: { url: image_url } }
-    : { type: "image_url", image_url: { url: `data:image/*;base64,${image_base64}` } };
+  // ==========================================================
+  // 모드별 처리
+  // ==========================================================
 
-  // 시스템 프롬프트: JSON만 반환하도록 강하게 가이드
-  const system = `
-You are an expert visual analyst and a prompt engineer for Adobe Firefly image generation.
-Analyze the given image and produce a concise JSON (no extra text) describing the scene.
-- Accept user's memo (which may be in Korean) and reflect it appropriately.
-- Translate concepts to natural English where needed.
-Return ONLY valid JSON with these fields:
-
-{
-  "subject": "short subject phrase",
-  "place": "location/background in a short phrase",
-  "time_weather": "time/weather (e.g., 'at midnight on a rainy night')",
-  "style": "art/style keywords (e.g., 'cinematic, cyberpunk, digital illustration')",
-  "color": "dominant colors or palette keywords",
-  "composition": "framing/composition (e.g., 'close-up portrait, rule-of-thirds')",
-  "camera": "camera details if applicable (e.g., '50mm lens, shallow depth of field')",
-  "lighting": "lighting mood (e.g., 'moody, neon-lit city lights')",
-  "details": "extra scene details",
-  "negatives": "things to avoid (optional)"
-}
-Return strictly JSON with no markdown fences.
-`.trim();
-
-  // 사용자 입력(텍스트 + 이미지)
-  const content = [
-    {
-      type: "text",
-      text:
-        `Analyze this image and produce JSON for Firefly.\n` +
-        (memo ? `User memo/hints: ${memo}\n` : "") +
-        `Respond in English JSON only.`,
-    },
-    imageBlock,
-  ];
-
-  try {
+  // ---------- 번역 모드 (영문 → 한글) ----------
+  if (mode === "translate_ko") {
+    if (!text) {
+      return new Response(JSON.stringify({ error: "No text for translate_ko" }), {
+        status: 400,
+        headers: corsHeaders,
+      });
+    }
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${API_KEY}`,
-        "HTTP-Referer": referer,
-        "X-Title": title,
-      },
+      headers: baseHeaders,
       body: JSON.stringify({
         model,
-        temperature,
+        temperature: 0.2,
         messages: [
-          { role: "system", content: system },
-          { role: "user", content },
+          {
+            role: "system",
+            content:
+              "You are a professional translator. Translate the user's text into KOREAN. Output ONLY the translated Korean text, no extra words.",
+          },
+          { role: "user", content: String(text) },
         ],
       }),
     });
 
-    const j = await r.json().catch(() => ({} as any));
+    const j = await r.json().catch(() => ({}));
+    const translated =
+      j?.choices?.[0]?.message?.content?.trim?.() ??
+      j?.output_text ??
+      "";
 
-    // 모델/프로바이더 추출
-    const modelUsed =
-      j?.model || j?.choices?.[0]?.model || model || "unknown";
-    const provider = "openrouter";
-
-    // JSON 파싱 시도
-    let analysis: any = null;
-    let textCandidate =
-      j?.choices?.[0]?.message?.content ?? j?.output_text ?? "";
-
-    if (textCandidate) {
-      try {
-        analysis = JSON.parse(textCandidate);
-      } catch {
-        // 모델이 JSON 외 텍스트를 섞어버렸을 때 대비: 중괄호만 추출 시도
-        const m = textCandidate.match(/\{[\s\S]*\}/);
-        if (m) {
-          try {
-            analysis = JSON.parse(m[0]);
-          } catch {
-            // 실패하면 null 유지
-          }
-        }
-      }
-    }
-
-    // 분석 실패 시 간단한 백업 분석 (아주 러프)
-    if (!analysis || typeof analysis !== "object") {
-      analysis = {
-        subject: "a person",
-        place: "",
-        time_weather: "",
-        style: "cinematic",
-        color: "",
-        composition: "",
-        camera: "",
-        lighting: "",
-        details: "",
-        negatives: "",
-      };
-    }
-
-    const finalPrompt = buildFinalPrompt(analysis);
-
-    return res.status(r.status || 200).json({
-      ok: r.ok,
-      status: r.status || 200,
-      provider,
-      model: modelUsed,
-      final_prompt: finalPrompt,
-      analysis,
-      raw: j,
-    });
-  } catch (e: any) {
-    return res.status(500).json({ error: e?.message || "OpenRouter request failed" });
+    return new Response(
+      JSON.stringify({
+        ok: r.ok,
+        status: r.status,
+        provider: "openrouter",
+        model,
+        text: translated,
+        error: j?.error?.message,
+      }),
+      { status: r.status, headers: corsHeaders }
+    );
   }
+
+  // ---------- Firefly Vision 모드 ----------
+  if (mode === "vision_firefly") {
+    if (!imageUrl || !prompt) {
+      return new Response(JSON.stringify({ error: "Need imageUrl + prompt" }), {
+        status: 400,
+        headers: corsHeaders,
+      });
+    }
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages: [
+          {
+            role: "system",
+            content: "You are an AI that analyzes and generates Firefly prompts.",
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: imageUrl } },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const j = await r.json().catch(() => ({}));
+    const out = j?.choices?.[0]?.message?.content?.trim?.() ?? "";
+    return new Response(
+      JSON.stringify({ text: out, raw: j }),
+      { status: r.status, headers: corsHeaders }
+    );
+  }
+
+  // ---------- Preset Chat 모드 ----------
+  if (mode === "preset") {
+    if (!prompt && !messages) {
+      return new Response(JSON.stringify({ error: "Need prompt or messages" }), {
+        status: 400,
+        headers: corsHeaders,
+      });
+    }
+
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages:
+          messages ??
+          [
+            {
+              role: "system",
+              content: "You are a helpful assistant.",
+            },
+            { role: "user", content: String(prompt) },
+          ],
+      }),
+    });
+
+    const j = await r.json().catch(() => ({}));
+    const out = j?.choices?.[0]?.message?.content?.trim?.() ?? "";
+    return new Response(
+      JSON.stringify({ text: out, raw: j }),
+      { status: r.status, headers: corsHeaders }
+    );
+  }
+
+  // ---------- Raw 프록시 모드 ----------
+  if (mode === "raw") {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    return new Response(JSON.stringify(j), {
+      status: r.status,
+      headers: corsHeaders,
+    });
+  }
+
+  return new Response(JSON.stringify({ error: "Unknown mode" }), {
+    status: 400,
+    headers: corsHeaders,
+  });
 }
+
+// ✅ CORS 헤더
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
